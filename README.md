@@ -9,6 +9,7 @@ Scopus cho ICTU. Giao diện web ở repo [Scopus-Ictu-FE](https://github.com/qh
 
 - `backend/` — mã nguồn API (`app/`), migration (`alembic/`), script tiện ích (`scripts/`), kiểm thử (`tests/`).
 - `data/` — chỉ có lược đồ (schema) và thư mục rỗng; dữ liệu thật không bao giờ được đưa lên.
+- `scopus-ictu-qhun22.bat` — trình khởi động máy thử nghiệm (gọi `backend/scripts/demo_launcher.py`); có kiểm thử đi kèm.
 
 ## Chạy
 
