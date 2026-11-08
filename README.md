@@ -3,7 +3,7 @@
 Backend (FastAPI + PostgreSQL + SQLAlchemy/Alembic) của hệ thống quản lý và chuẩn hóa hồ sơ tác giả, công bố khoa học
 Scopus cho ICTU. Giao diện web ở repo [Scopus-Ictu-FE](https://github.com/qhun22/Scopus-Ictu-FE).
 
-> Repo này được đồng bộ từ repo chính [Scopus-Ictu](https://github.com/qhun22/Scopus-Ictu) (commit `753547d`). Mọi thay đổi mã nguồn làm ở repo chính.
+> Repo này được đồng bộ từ repo chính [Scopus-Ictu](https://github.com/qhun22/Scopus-Ictu) (commit `3d6c62a`). Mọi thay đổi mã nguồn làm ở repo chính.
 
 ## Cấu trúc
 
