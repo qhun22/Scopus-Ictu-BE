@@ -1,0 +1,99 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# --- Node / Frontend ---
+node_modules/
+dist/
+build/
+.parcel-cache/
+.next/
+.nuxt/
+.cache/
+
+# --- Environment / Secrets ---
+.env
+backend/.env
+.env.local
+.env.*.local
+*.pem
+secrets/
+
+# --- Compose overrides (developer-specific) ---
+compose.local.override.yaml
+
+# --- Data (real source data is NEVER committed) ---
+data/raw_scopus/*
+!data/raw_scopus/.gitkeep
+data/scopus/Truong_Quang_Huy_Scopus_Sep2026.csv
+data/snapshots/*
+!data/snapshots/.gitkeep
+data/test_fixtures/*
+!data/test_fixtures/.gitkeep
+
+# --- Dữ liệu giảng viên thật (không bao giờ commit) ---
+data/lecturers/ictu_lecturers.json
+data/lecturers/ictu_lecturers.example.json
+data/lecturers/raw/*
+!data/lecturers/raw/.gitkeep
+data/lecturers/reports/lecturer_dataset_report.json
+data/matching/evaluation/primary_cohort_source_ids.txt
+
+# --- IDE / OS ---
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# --- Logs / temp ---
+*.log
+*.bak
+*.tmp
+backend/.tmp_*/
+
+# --- Local backups ---
+local_backups/
+
+# --- Testing ---
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Alembic (only migrations generated under M1 belong in VCS) ---
+# alembic/versions/.gitkeep is intentionally tracked.
+
+data/diagram-skills-package/
+
+# --- Local database backups and per-environment config (never commit) ---
+*.dump
+*.dump.sha256
+.env.*
+!.env.example
+
+# --- Workspace phoi hop chung Hun12 (local only) ---
+/Hun12/
+# Thu muc cu da hop nhat vao Hun12 (07/11/2026); giu de khong vo tinh day len neu bi tao lai.
+/Hun1/
+/Hun2/
+
+# Moved out of repo
+docs/
+scripts/
+!backend/scripts/
+*.bat
+!scopus-ictu-qhun22.bat

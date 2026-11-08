@@ -1,0 +1,509 @@
+"""Transactional rollback service for lecturer dataset imports.
+
+Enforces provenance-driven ownership rules (M2.5A §35):
+- Manual lecturers are always preserved.
+- Lecturers created solely by this import are safely removed.
+- Pre-existing lecturers updated by this import are preserved and restored
+  to their prior state if earlier snapshot provenance exists.
+- Multi-source lecturers retain non-import provenance and are preserved.
+- Lecturers linked to user accounts or downstream Scopus identities BLOCK
+  rollback with LECTURER_IMPORT_IN_USE (409) without deleting or unlinking users.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import uuid
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.models.candidate import (
+    LecturerScopusCandidate,
+    LecturerScopusCandidateEvidence,
+    LecturerScopusCandidateObservation,
+    LecturerScopusCandidateReview,
+)
+from app.models.governance import AuditEvent, User, UserNotification
+from app.models.identity import LecturerScopusIdentity
+from app.models.master_lecturer import (
+    Lecturer,
+    LecturerKnownPublication,
+    LecturerSourceSnapshot,
+)
+
+
+CRAW_SOURCE_SYSTEM = "ictu_craw"
+
+
+def _ever_created_lecturer_ids(db: Session) -> set[uuid.UUID]:
+    """Lecturer ids recorded as created by any lecturer-dataset import (active or rolled back)."""
+
+    found: set[uuid.UUID] = set()
+    for audit in db.query(AuditEvent).filter(
+        AuditEvent.entity_type == "lecturer_dataset",
+        AuditEvent.action == "LECTURER_DATASET_IMPORTED",
+    ):
+        raw = (
+            (audit.event_metadata or {}).get("created_lecturer_ids")
+            or (audit.after_state or {}).get("created_lecturer_ids")
+            or []
+        )
+        for value in raw:
+            try:
+                found.add(uuid.UUID(str(value)))
+            except (ValueError, TypeError):
+                pass
+    return found
+
+
+class LecturerRollbackError(RuntimeError):
+    """Raised when import rollback is blocked or fails."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status_code: int = 409,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        self.data = data or {}
+
+
+@dataclasses.dataclass(frozen=True)
+class LecturerRollbackSummary:
+    import_id: uuid.UUID
+    filename: str
+    actor_user_id: uuid.UUID
+    created_records_removed: int
+    updated_records_restored: int
+    manual_records_preserved: int
+    multi_source_records_preserved: int
+    blocked_records: int
+    rolled_back_at: datetime
+
+
+class LecturerRollbackService:
+    """Execute atomic rollback of a lecturer dataset import."""
+
+    def rollback_import(
+        self,
+        db: Session,
+        *,
+        import_id: uuid.UUID,
+        actor: User,
+    ) -> LecturerRollbackSummary:
+        now = datetime.now(UTC)
+
+        # 1. Locate the import audit event. The public history ID is the audit
+        # event ID, while rollback events are linked by the batch entity ID.
+        audit = (
+            db.query(AuditEvent)
+            .filter(
+                AuditEvent.entity_type == "lecturer_dataset",
+                AuditEvent.action == "LECTURER_DATASET_IMPORTED",
+                (AuditEvent.id == import_id) | (AuditEvent.entity_id == import_id),
+            )
+            .first()
+        )
+
+        if audit is None:
+            raise LecturerRollbackError(
+                "LECTURER_IMPORT_NOT_FOUND",
+                "Không tìm thấy đợt nhập giảng viên cần hoàn tác.",
+                status_code=404,
+            )
+
+        # 2. Check rollback state using the canonical batch entity ID. Checking
+        # only against ``import_id`` misses events when audit.id != audit.entity_id.
+        batch_entity_id = audit.entity_id or audit.id
+        rolled_back_audit = (
+            db.query(AuditEvent)
+            .filter(
+                AuditEvent.entity_type == "lecturer_dataset",
+                AuditEvent.action == "LECTURER_DATASET_ROLLED_BACK",
+                (AuditEvent.entity_id == batch_entity_id)
+                | (AuditEvent.entity_id == audit.id),
+            )
+            .first()
+        )
+        if rolled_back_audit is not None:
+            raise LecturerRollbackError(
+                "LECTURER_IMPORT_ALREADY_ROLLED_BACK",
+                "Đợt nhập này đã được hoàn tác trước đó.",
+                status_code=409,
+            )
+
+        meta = audit.event_metadata or {}
+        after = audit.after_state or {}
+
+        # 3. Extract recorded snapshot IDs and created lecturer IDs (Authoritative Ownership)
+        snapshot_ids_raw = meta.get("snapshot_ids") or after.get("snapshot_ids") or []
+        batch_snapshot_ids: set[uuid.UUID] = set()
+        for s in snapshot_ids_raw:
+            try:
+                batch_snapshot_ids.add(uuid.UUID(str(s)))
+            except (ValueError, TypeError):
+                pass
+
+        created_lecturer_ids_raw = (
+            meta.get("created_lecturer_ids")
+            or after.get("created_lecturer_ids")
+            or []
+        )
+        batch_created_lecturer_ids: set[uuid.UUID] = set()
+        for lid in created_lecturer_ids_raw:
+            try:
+                batch_created_lecturer_ids.add(uuid.UUID(str(lid)))
+            except (ValueError, TypeError):
+                pass
+
+        # Load snapshots belonging to this batch
+        snapshots: list[LecturerSourceSnapshot] = []
+        if batch_snapshot_ids:
+            snapshots = (
+                db.query(LecturerSourceSnapshot)
+                .filter(LecturerSourceSnapshot.id.in_(batch_snapshot_ids))
+                .all()
+            )
+
+        all_batch_lecturer_ids = {
+            s.lecturer_id for s in snapshots if s.lecturer_id is not None
+        }.union(batch_created_lecturer_ids)
+        # Lecturers created by ANY import. When an earlier creator was rolled back while a later
+        # import still covered them, they were kept; once nothing covers them any more they go too.
+        ever_created_lecturer_ids = _ever_created_lecturer_ids(db)
+
+        # 4. Categorize every touched lecturer
+        to_delete_lecturer_ids: set[uuid.UUID] = set()
+        to_restore_lecturers: list[tuple[Lecturer, dict]] = []
+        manual_preserved_count = 0
+        multi_source_count = 0
+
+        for lecturer_id in all_batch_lecturer_ids:
+            lecturer = db.query(Lecturer).filter(Lecturer.id == lecturer_id).first()
+            if lecturer is None:
+                continue
+
+            # Check all snapshots for this lecturer
+            all_snapshots = (
+                db.query(LecturerSourceSnapshot)
+                .filter(LecturerSourceSnapshot.lecturer_id == lecturer_id)
+                .order_by(LecturerSourceSnapshot.created_at.asc())
+                .all()
+            )
+
+            other_snaps = [
+                s
+                for s in all_snapshots
+                if s.id not in batch_snapshot_ids and s.source_system != CRAW_SOURCE_SYSTEM
+            ]
+
+            if len(other_snaps) > 0:
+                # CASE B & C: Pre-existing / Multi-source with prior snapshot
+                multi_source_count += 1
+                prev_snap = other_snaps[-1]
+                prev_canonical = prev_snap.raw_payload.get("canonical")
+                if prev_canonical and isinstance(prev_canonical, dict):
+                    to_restore_lecturers.append((lecturer, prev_canonical))
+                # Other provenance owns this lecturer too, so this import may
+                # restore it but must never delete it.
+            elif (
+                lecturer_id in batch_created_lecturer_ids
+                or lecturer_id in ever_created_lecturer_ids
+            ):
+                # CASE A: Explicitly recorded as created by this batch via
+                # created_lecturer_ids (authoritative source). Queued for removal;
+                # the blocker check below will raise 409 if a user or identity
+                # has been linked since the import.
+                to_delete_lecturer_ids.add(lecturer_id)
+            else:
+                # CASE D: Lecturer was only touched by this batch (no other
+                # snapshots) and is not recorded as created by this batch.
+                # Treat as a manually-created lecturer — preserve it.
+                manual_preserved_count += 1
+
+        # 5. Enforce Blockers BEFORE Mutating Database
+        # Check User account linkage blocker
+        # LECTURER-role accounts are auto-removed with the profile.
+        # Non-LECTURER accounts (ADMIN, etc.) block rollback — they were
+        # granted intentionally and must be handled manually.
+        lecturer_role_users_to_delete: list[User] = []
+        if to_delete_lecturer_ids:
+            linked_users = (
+                db.query(User)
+                .filter(User.lecturer_id.in_(to_delete_lecturer_ids))
+                .all()
+            )
+            non_lecturer_users = [u for u in linked_users if u.role != "LECTURER"]
+            if non_lecturer_users:
+                raise LecturerRollbackError(
+                    "LECTURER_IMPORT_IN_USE",
+                    f"Có {len(non_lecturer_users)} hồ sơ trong đợt nhập đang được liên kết "
+                    "với tài khoản hệ thống (không phải LECTURER). Vui lòng xử lý các liên kết trước.",
+                    status_code=409,
+                    data={"linked_accounts": len(non_lecturer_users)},
+                )
+            lecturer_role_users_to_delete = [u for u in linked_users if u.role == "LECTURER"]
+
+            # Check downstream Scopus identities blocker
+            linked_identities = (
+                db.query(LecturerScopusIdentity)
+                .filter(LecturerScopusIdentity.lecturer_id.in_(to_delete_lecturer_ids))
+                .all()
+            )
+            if linked_identities:
+                raise LecturerRollbackError(
+                    "LECTURER_IMPORT_IN_USE",
+                    "Không thể hoàn tác đợt nhập vì có "
+                    f"{len(linked_identities)} hồ sơ đã phát sinh liên kết Scopus "
+                    "hoặc dữ liệu downstream.",
+                    status_code=409,
+                    data={"dependent_identities": len(linked_identities)},
+                )
+
+        # 6. Atomic Rollback Execution
+        created_removed_count = len(to_delete_lecturer_ids)
+        updated_restored_count = 0
+
+        try:
+            # A. Restore fields of updated records from prior snapshot
+            for lecturer, prev_canonical in to_restore_lecturers:
+                new_full_name = prev_canonical.get("full_name", lecturer.full_name)
+                lecturer.full_name = new_full_name
+                lecturer.full_name_normalized = new_full_name.casefold().strip()
+                lecturer.staff_code = prev_canonical.get("staff_code")
+                lecturer.email = prev_canonical.get("institutional_email")
+                lecturer.academic_degree = prev_canonical.get("academic_degree")
+                lecturer.academic_rank = prev_canonical.get("academic_rank")
+                lecturer.position = prev_canonical.get("position")
+                lecturer.faculty = prev_canonical.get("faculty")
+                lecturer.department = prev_canonical.get("department")
+                lecturer.repository_profile_url = prev_canonical.get("profile_url")
+                lecturer.orcid = prev_canonical.get("orcid")
+                lecturer.is_active = prev_canonical.get("is_active", True)
+                updated_restored_count += 1
+
+            # B. Delete known publications belonging to this batch
+            if batch_snapshot_ids:
+                db.query(LecturerKnownPublication).filter(
+                    LecturerKnownPublication.snapshot_id.in_(batch_snapshot_ids)
+                ).delete(synchronize_session=False)
+
+            # C. Delete snapshots belonging to this batch
+            if batch_snapshot_ids:
+                db.query(LecturerSourceSnapshot).filter(
+                    LecturerSourceSnapshot.id.in_(batch_snapshot_ids)
+                ).delete(synchronize_session=False)
+
+            # D. Delete lecturers created only by this batch.
+            # Must purge all FK dependents first (RESTRICT constraints):
+            #   lecturer_source_snapshots, lecturer_scopus_candidates (+ their
+            #   observations/evidence/reviews).
+            if to_delete_lecturer_ids:
+                self._purge_lecturers(db, to_delete_lecturer_ids, lecturer_role_users_to_delete, batch_snapshot_ids)
+
+            # E. Append-only: Record rollback audit event without deleting the original import audit
+            filename = meta.get("filename", "ictu_lecturers.json")
+            rollback_audit = AuditEvent(
+                entity_type="lecturer_dataset",
+                entity_id=audit.entity_id or audit.id,
+                action="LECTURER_DATASET_ROLLED_BACK",
+                actor_type="USER",
+                actor_user_id=actor.id,
+                actor_service=None,
+                before_state=audit.after_state,
+                after_state={"status": "ROLLED_BACK"},
+                event_metadata={
+                    "import_id": str(import_id),
+                    "filename": filename,
+                    "actor_user_id": str(actor.id),
+                    "created_records_removed": created_removed_count,
+                    "updated_records_restored": updated_restored_count,
+                    "manual_records_preserved": manual_preserved_count,
+                    "multi_source_records_preserved": multi_source_count,
+                    "blocked_records": 0,
+                    "rolled_back_at": now.isoformat(),
+                },
+            )
+            db.add(rollback_audit)
+            db.commit()
+
+        except SQLAlchemyError as exc:
+            db.rollback()
+            raise LecturerRollbackError(
+                "LECTURER_IMPORT_ROLLBACK_FAILED",
+                "Không thể hoàn tất hoàn tác đợt nhập giảng viên do lỗi cơ sở dữ liệu.",
+                status_code=500,
+            ) from exc
+
+        return LecturerRollbackSummary(
+            import_id=import_id,
+            filename=meta.get("filename", "ictu_lecturers.json"),
+            actor_user_id=actor.id,
+            created_records_removed=created_removed_count,
+            updated_records_restored=updated_restored_count,
+            manual_records_preserved=manual_preserved_count,
+            multi_source_records_preserved=multi_source_count,
+            blocked_records=0,
+            rolled_back_at=now,
+        )
+
+    def purge_orphans(self, db: Session, *, actor: User) -> int:
+        """Remove imported lecturers that no import covers any more. Returns how many were removed.
+
+        Same safety as a rollback: a non-LECTURER account or a Scopus identity on any of them blocks it.
+        """
+
+        orphan_ids = find_orphaned_imported_lecturers(db)
+        if not orphan_ids:
+            return 0
+        users = db.query(User).filter(User.lecturer_id.in_(orphan_ids)).all()
+        blocking = [u for u in users if u.role != "LECTURER"]
+        identities = (
+            db.query(LecturerScopusIdentity)
+            .filter(LecturerScopusIdentity.lecturer_id.in_(orphan_ids))
+            .count()
+        )
+        if blocking or identities:
+            raise LecturerRollbackError(
+                "LECTURER_IMPORT_IN_USE",
+                "Có hồ sơ giảng viên mồ côi đang gắn tài khoản hệ thống hoặc định danh Scopus.",
+                status_code=409,
+                data={"linked_accounts": len(blocking), "dependent_identities": identities},
+            )
+        try:
+            self._purge_lecturers(db, orphan_ids, [u for u in users if u.role == "LECTURER"], set())
+            db.add(
+                AuditEvent(
+                    entity_type="lecturer_dataset",
+                    entity_id=uuid.uuid4(),
+                    action="LECTURER_ORPHANS_PURGED",
+                    actor_type="USER",
+                    actor_user_id=actor.id,
+                    before_state=None,
+                    after_state={"removed": len(orphan_ids)},
+                    event_metadata={"removed": len(orphan_ids)},
+                )
+            )
+            db.commit()
+        except SQLAlchemyError as exc:
+            db.rollback()
+            raise LecturerRollbackError(
+                "LECTURER_ORPHAN_PURGE_FAILED",
+                "Không thể dọn hồ sơ giảng viên mồ côi do lỗi cơ sở dữ liệu.",
+                status_code=500,
+            ) from exc
+        return len(orphan_ids)
+
+    def _purge_lecturers(
+        self,
+        db: Session,
+        to_delete_lecturer_ids: set[uuid.UUID],
+        lecturer_role_users_to_delete: list[User],
+        batch_snapshot_ids: set[uuid.UUID],
+    ) -> None:
+        """Delete lecturers and every dependent row (FK order matters)."""
+
+        # D0. Auto-remove LECTURER-role user accounts linked to deleted profiles.
+        if lecturer_role_users_to_delete:
+            user_ids = [u.id for u in lecturer_role_users_to_delete]
+            db.query(UserNotification).filter(
+                UserNotification.user_id.in_(user_ids)
+            ).delete(synchronize_session=False)
+            for user in lecturer_role_users_to_delete:
+                db.delete(user)
+            db.flush()
+
+        # D1. Extra snapshots outside this batch (same FK guard as B/C).
+        extra_snaps = (
+            db.query(LecturerSourceSnapshot)
+            .filter(
+                LecturerSourceSnapshot.lecturer_id.in_(to_delete_lecturer_ids),
+                LecturerSourceSnapshot.id.not_in(batch_snapshot_ids)
+                if batch_snapshot_ids
+                else True,
+            )
+            .all()
+        )
+        if extra_snaps:
+            extra_snap_ids = {s.id for s in extra_snaps}
+            db.query(LecturerKnownPublication).filter(
+                LecturerKnownPublication.snapshot_id.in_(extra_snap_ids)
+            ).delete(synchronize_session=False)
+            db.query(LecturerSourceSnapshot).filter(
+                LecturerSourceSnapshot.id.in_(extra_snap_ids)
+            ).delete(synchronize_session=False)
+
+        # D2. Scopus candidate cascade:
+        #   reviews → evidence → observations → candidates
+        candidate_ids_rows = (
+            db.query(LecturerScopusCandidate.id)
+            .filter(
+                LecturerScopusCandidate.lecturer_id.in_(to_delete_lecturer_ids)
+            )
+            .all()
+        )
+        if candidate_ids_rows:
+            candidate_ids = {row.id for row in candidate_ids_rows}
+            obs_ids_rows = (
+                db.query(LecturerScopusCandidateObservation.id)
+                .filter(
+                    LecturerScopusCandidateObservation.candidate_id.in_(
+                        candidate_ids
+                    )
+                )
+                .all()
+            )
+            if obs_ids_rows:
+                obs_ids = {row.id for row in obs_ids_rows}
+                db.query(LecturerScopusCandidateEvidence).filter(
+                    LecturerScopusCandidateEvidence.observation_id.in_(obs_ids)
+                ).delete(synchronize_session=False)
+            db.query(LecturerScopusCandidateReview).filter(
+                LecturerScopusCandidateReview.candidate_id.in_(candidate_ids)
+            ).delete(synchronize_session=False)
+            db.query(LecturerScopusCandidateObservation).filter(
+                LecturerScopusCandidateObservation.candidate_id.in_(candidate_ids)
+            ).delete(synchronize_session=False)
+            db.query(LecturerScopusCandidate).filter(
+                LecturerScopusCandidate.id.in_(candidate_ids)
+            ).delete(synchronize_session=False)
+
+        db.query(Lecturer).filter(
+            Lecturer.id.in_(to_delete_lecturer_ids)
+        ).delete(synchronize_session=False)
+
+
+def find_orphaned_imported_lecturers(db: Session) -> set[uuid.UUID]:
+    """Imported lecturers no import covers any more (every creating import was rolled back)."""
+
+    created = _ever_created_lecturer_ids(db)
+    if not created:
+        return set()
+    existing = {row[0] for row in db.query(Lecturer.id).filter(Lecturer.id.in_(created)).all()}
+    covered = {
+        row[0]
+        for row in db.query(LecturerSourceSnapshot.lecturer_id)
+        .filter(
+            LecturerSourceSnapshot.lecturer_id.in_(existing),
+            LecturerSourceSnapshot.source_system != CRAW_SOURCE_SYSTEM,
+        )
+        .all()
+    }
+    return existing - covered
+
+
+__all__ = [
+    "find_orphaned_imported_lecturers",
+    "LecturerRollbackError",
+    "LecturerRollbackService",
+    "LecturerRollbackSummary",
+]

@@ -1,0 +1,95 @@
+"""Application entry point — M2.2/M2.5 runtime implementation.
+
+Wires FastAPI application with CORS middleware, settings, and v1 API routers.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from app.api.v1.router import router as v1_router
+from app.core.config import settings
+from app.core.exceptions import APIError, api_error_handler
+from app.core.request_guards import reject_nul_in_url
+from app.services.affiliation_enrichment_service import recover_interrupted_enrichment_jobs
+from app.services.scopus_import_service import recover_interrupted_imports
+
+logger = logging.getLogger(__name__)
+
+
+def create_app() -> FastAPI:
+    """Factory for the FastAPI application."""
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        if getattr(application.state, "import_recovery_enabled", True):
+            try:
+                recovered = recover_interrupted_imports()
+                if recovered:
+                    logger.warning("Recovered %s interrupted Scopus import job(s).", recovered)
+            except Exception:
+                logger.exception("Could not recover interrupted Scopus imports at startup.")
+            try:
+                recovered_enrichment = recover_interrupted_enrichment_jobs()
+                if recovered_enrichment:
+                    logger.warning(
+                        "Marked %s interrupted affiliation enrichment job(s) as FAILED.",
+                        recovered_enrichment,
+                    )
+            except Exception:
+                logger.exception("Could not recover interrupted affiliation enrichment jobs at startup.")
+        yield
+
+    app = FastAPI(
+        title="Scopus-Ictu API",
+        description="Identity reconciliation pipeline between ICTU Repository and Scopus records.",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    app.state.import_recovery_enabled = True
+
+    # CORS configuration with credentials enabled for HttpOnly cookie exchange
+    origins = settings.cors_origins_list
+    if not origins:
+        origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+    # Added before CORS so CORS stays outermost and the 422 still carries the CORS headers.
+    app.middleware("http")(reject_nul_in_url)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.add_exception_handler(APIError, api_error_handler)
+
+    @app.get("/health", summary="Health check")
+    def health() -> dict[str, str]:
+        """Health check endpoint to verify backend service readiness."""
+        return {"status": "ok", "app": "Scopus-Ictu API", "version": "0.1.0"}
+
+    app.include_router(v1_router, prefix="/api/v1")
+
+    # Serve built React frontend when FRONTEND_DIST_DIR is set.
+    # Must be mounted LAST so API routes take priority.
+    frontend_dist = os.environ.get(
+        "FRONTEND_DIST_DIR",
+        str(Path(__file__).resolve().parents[2] / "frontend" / "dist"),
+    )
+    if Path(frontend_dist).is_dir():
+        app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
+
+    return app
+
+
+app = create_app()
+
+__all__ = ["app"]

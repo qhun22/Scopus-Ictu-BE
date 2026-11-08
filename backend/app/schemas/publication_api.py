@@ -1,0 +1,251 @@
+"""Typed read schemas for the canonical publication API."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+AffiliationLinkStatus = Literal["VERIFIED", "CORROBORATED", "UNRESOLVED", "NOT_RECONCILED"]
+
+
+class PublicationListItem(BaseModel):
+    """Safe, lightweight canonical publication list item."""
+
+    publication_id: UUID
+    eid: str
+    doi: str | None
+    title: str
+    source_title: str | None
+    year: int | None
+    cited_by_count: int | None
+    document_type: str | None
+    publication_stage: str | None
+    open_access_status: str | None
+
+
+class PublicationListResponse(BaseModel):
+    """Server-paginated canonical publication list."""
+
+    items: list[PublicationListItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class PublicationFilterOption(BaseModel):
+    """One selectable value for a publication list filter, with its row count."""
+
+    value: str
+    count: int
+
+
+class PublicationFilterOptions(BaseModel):
+    """Distinct values currently present in the canonical publication table,
+    used to populate the publication list filter dropdowns (so a filter only
+    ever offers a value that can actually match something)."""
+
+    years: list[int]
+    document_types: list[PublicationFilterOption]
+    publication_stages: list[PublicationFilterOption]
+    open_access_statuses: list[PublicationFilterOption]
+    missing_doi_count: int
+
+
+class AffiliationOrganizationRead(BaseModel):
+    """Organization as normalized by the EXTERNAL source (never merged across sources)."""
+
+    source_system: str
+    source_org_id: str | None
+    ror: str | None
+    display_name: str
+    country_code: str | None
+
+
+class AffiliationProvenanceRead(BaseModel):
+    """Safe trace of how an external authorship was tied to this Scopus author."""
+
+    link_method: str
+    source_work_id: str | None
+    source_doi: str | None
+    external_position: int | None
+    external_author_name: str | None
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuthorAffiliationRead(BaseModel):
+    """One affiliation string (and its source-normalized organizations) of a trusted link.
+
+    ``scope`` is fixed: this is the author's affiliation on THIS publication as
+    stated by an external metadata source.  It is not asserted by Scopus, is not
+    the repository's publication-level unit, and is not a lecturer's current unit.
+    """
+
+    link_status: Literal["VERIFIED", "CORROBORATED"]
+    source_system: str
+    raw_affiliation_text: str | None
+    organizations: list[AffiliationOrganizationRead] = Field(default_factory=list)
+    retrieved_at: datetime
+    scope: Literal["AUTHOR_ON_PUBLICATION_EXTERNAL_SOURCE"] = "AUTHOR_ON_PUBLICATION_EXTERNAL_SOURCE"
+    provenance: AffiliationProvenanceRead
+
+
+class AffiliationResolutionRead(BaseModel):
+    """Outcome of reconciling one external source with this author position."""
+
+    source_system: str
+    link_status: Literal["VERIFIED", "CORROBORATED", "UNRESOLVED"]
+    link_method: str | None
+    unresolved_reason: str | None
+    # PRESENT / ABSENT (source lists no unit) for trusted links; null = unknown (UNRESOLVED)
+    affiliation_presence: Literal["PRESENT", "ABSENT"] | None
+    retrieved_at: datetime | None
+    source_work_id: str | None
+
+
+class AffiliationOverrideRead(BaseModel):
+    """ADMIN-entered affiliation statement, layered on top of the automated
+    resolutions — never asserted as independently verified by this alone.
+    A position may have several of these at once (e.g. a dual appointment).
+
+    Public-safe subset shown in the publication detail (read by ADMIN,
+    REVIEWER and LECTURER alike): no internal IDs (publication_author_id,
+    actor user ids). Only ACTIVE overrides are ever included here — a
+    REVOKED one is history, visible only through the ADMIN-only
+    ``/needs-review`` and ``/overrides`` endpoints. The ADMIN review UI
+    also gets per-row ids/actor ids from those dedicated endpoints.
+    """
+
+    affiliation_text: str
+    confidence: Literal["CORROBORATED", "UNRESOLVED"]
+    evidence_url: str
+    reason: str
+    updated_at: datetime
+    note: str = (
+        "Entered by an ADMIN after manual review; not an independent identity "
+        "verification. Never counted as VERIFIED."
+    )
+
+
+class PublicationAuthorRead(BaseModel):
+    """Ordered, public-safe Scopus author summary."""
+
+    author_order: int
+    scopus_id: str
+    preferred_name: str
+    # Additive affiliation block.  NOT_RECONCILED = no reconciliation was ever run.
+    affiliation_status: AffiliationLinkStatus = "NOT_RECONCILED"
+    # True: a trusted source lists a unit; False: trusted source lists none; null: unknown.
+    source_has_affiliation: bool | None = None
+    affiliations: list[AuthorAffiliationRead] = Field(default_factory=list)
+    affiliation_resolutions: list[AffiliationResolutionRead] = Field(default_factory=list)
+    # ALL currently-active ADMIN overrides for this position (0, 1, or many).
+    affiliation_overrides: list[AffiliationOverrideRead] = Field(default_factory=list)
+    # Public-safe: just the lecturer's name when this position has an APPROVED
+    # LecturerScopusIdentity link, else None. No staff code/ORCID here — those
+    # stay in approved_lecturer_links, which is withheld from LECTURER readers.
+    ictu_lecturer_name: str | None = None
+
+
+class AffiliationSummaryRead(BaseModel):
+    """Counts of author positions by affiliation confidence (mutually exclusive)."""
+
+    authors: int
+    verified_with_affiliation: int
+    verified_without_affiliation: int
+    corroborated_with_affiliation: int
+    corroborated_without_affiliation: int
+    unresolved: int
+    not_reconciled: int
+    # Strictest reading: every author VERIFIED and with an affiliation.
+    all_authors_verified_with_affiliation: bool
+    # Weaker reading: every author VERIFIED or CORROBORATED and with an affiliation.
+    all_authors_verified_or_corroborated_with_affiliation: bool
+    note: str = (
+        "Affiliations are author-level statements of external metadata sources "
+        "(OpenAlex/Crossref), not asserted by Scopus. CORROBORATED is not verified."
+    )
+
+
+EvidenceLevel = Literal[
+    "IDENTIFIER_SUPPORT",
+    "PUBLICATION_SUPPORT",
+    "NAME_ONLY",
+    "NO_RECORDED_EVIDENCE",
+]
+
+
+class LinkEvidenceBasisRead(BaseModel):
+    """D-3: what the approved link rests on, derived from identity_evidence rows only.
+
+    A reviewer's ACCEPT is never evidence; ``independently_verified`` is true only
+    for an exact independent identifier match with no contradicting evidence.
+    """
+
+    level: EvidenceLevel
+    supporting_evidence_types: list[str] = Field(default_factory=list)
+    contradicting_evidence_types: list[str] = Field(default_factory=list)
+    identifier_evidence_count: int = 0
+    publication_evidence_count: int = 0
+    name_evidence_count: int = 0
+    affiliation_evidence_count: int = 0
+    independently_verified: bool = False
+
+
+class LinkReviewDecisionRead(BaseModel):
+    """The human review decision that created the link (provenance, not evidence)."""
+
+    action: Literal["ACCEPT"] = "ACCEPT"
+    decided_at: datetime
+    reason: str | None = None
+
+
+class PublicationLecturerLinkRead(BaseModel):
+    """Approved lecturer link at a concrete publication author position."""
+
+    author_order: int
+    scopus_id: str
+    full_name: str
+    staff_code: str | None
+    department: str | None
+    faculty: str | None
+    orcid: str | None
+    # Additive (D-3); older clients ignore these fields.
+    link_status: Literal["APPROVED"] = "APPROVED"
+    evidence_basis: LinkEvidenceBasisRead | None = None
+    review_decision: LinkReviewDecisionRead | None = None
+
+
+class PublicationProvenanceRead(BaseModel):
+    """Human-readable provenance for one canonical publication source row."""
+
+    file_name: str
+    file_sha256: str
+    row_number: int
+    imported_at: datetime
+
+
+class PublicationDetailResponse(BaseModel):
+    """Canonical publication metadata and safe read-only relationships."""
+
+    publication_id: UUID
+    eid: str
+    doi: str | None
+    title: str
+    source_title: str | None
+    year: int | None
+    volume: str | None
+    issue: str | None
+    art_no: str | None
+    page_start: str | None
+    page_end: str | None
+    cited_by_count: int | None
+    document_type: str | None
+    publication_stage: str | None
+    open_access_status: str | None
+    authors: list[PublicationAuthorRead]
+    affiliation_summary: AffiliationSummaryRead | None = None
+    approved_lecturer_links: list[PublicationLecturerLinkRead]
+    provenance: list[PublicationProvenanceRead]

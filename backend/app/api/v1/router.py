@@ -1,0 +1,59 @@
+"""v1 router aggregator — M0 scaffold.
+
+Wires endpoint modules under a single APIRouter.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter
+
+from app.api.v1.endpoints import (
+    affiliations,
+    audits,
+    auth,
+    authors,
+    dashboard,
+    feedback,
+    imports,
+    lecturer_scopus,
+    lecturers,
+    matching,
+    notifications,
+    publication_exclusions,
+    publications,
+    reviews,
+    search,
+    system,
+    users,
+)
+
+router = APIRouter()
+router.include_router(auth.router, prefix="/auth", tags=["auth"])
+router.include_router(users.router, prefix="/users", tags=["users"])
+router.include_router(
+    notifications.router, prefix="/notifications", tags=["notifications"]
+)
+router.include_router(
+    lecturer_scopus.router,
+    prefix="/lecturers",
+    tags=["lecturer-scopus"],
+)
+router.include_router(lecturers.router, prefix="/lecturers", tags=["lecturers"])
+router.include_router(imports.router, prefix="/imports", tags=["imports"])
+router.include_router(
+    publication_exclusions.router,
+    prefix="/publication-exclusions",
+    tags=["publication-exclusions"],
+)
+router.include_router(publications.router, prefix="/publications", tags=["publications"])
+router.include_router(authors.router, prefix="/authors", tags=["authors"])
+router.include_router(matching.router, prefix="/matching", tags=["matching"])
+router.include_router(reviews.router, prefix="/reviews", tags=["reviews"])
+router.include_router(
+    affiliations.router, prefix="/affiliations", tags=["affiliations"]
+)
+router.include_router(audits.router, prefix="/audits", tags=["audits"])
+router.include_router(search.router, prefix="/search", tags=["search"])
+router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
+router.include_router(system.router, prefix="/system", tags=["system"])
+router.include_router(feedback.router, prefix="/feedback", tags=["feedback"])
